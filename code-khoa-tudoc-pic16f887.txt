@@ -1,0 +1,320 @@
+// =======================================
+// DOOR LOCK SYSTEM - PIC16F887 + KEYPAD 4x3 + LCD 16x2
+// LCD 16x2 - ASCII  
+// =======================================
+
+unsigned short kp;
+char current_code[5];      // current password (4 digits + '\0')
+char temp_code[5];         // confirm password
+char input_code[5];        // user input
+unsigned short i;
+int fail_count = 0;
+int alarm_time;
+
+// Password config
+#define PASS_LEN        4
+#define MAX_FAIL        3
+
+// =======================================
+// TEXT MESSAGES (NO ACCENTS)
+// =======================================
+char msg_set1[]          = "NHAP MA MOI";           // Enter new code
+char msg_set2[]          = "XAC NHAN LAI MA";       // Confirm new code
+char msg_set_fail[]      = "MA KHONG KHOP!";        // Code not match
+char msg_setup_ok[]      = "THIET LAP OK";          // Setup OK
+
+char msg_enter_title[]   = "NHAP MA (4 SO)";        // Enter code (4 digits)
+char msg_enter_line2[]   = "NHAP: ";                // "NHAP: ****"
+
+char msg_success_access[]= "MO KHOA THANH CONG";    // Door unlock success
+char msg_success_short[] = "MO KHOA OK!";           // Short version
+
+char msg_denied[]        = "SAI MA!";               // Wrong code
+char msg_try_left[]      = "CON LAI: ";             // Attempts left
+char msg_lockout[]       = "KHOA HE THONG";         // System lockout
+char msg_reset[]         = "NHAP SAI 3 LAN!";       // 3 wrong tries
+char msg_special_reset[] = "RESET HE THONG";        // Reset system
+char msg_welcome1[]      = "KHOA CUA MAT MA";       // Welcome line 1
+char msg_welcome2[]      = "DUNG PIC16F887";        // Welcome line 2
+
+// Special reset code
+char reset_code[5]       = "9999";
+
+// =======================================
+// KEYPAD & LCD CONFIG
+// =======================================
+char keypadPort at PORTD;
+
+// LCD config (PORTB)
+sbit LCD_RS at RB2_bit;
+sbit LCD_EN at RB3_bit;
+sbit LCD_D4 at RB4_bit;
+sbit LCD_D5 at RB5_bit;
+sbit LCD_D6 at RB6_bit;
+sbit LCD_D7 at RB7_bit;
+
+sbit LCD_RS_Direction at TRISB2_bit;
+sbit LCD_EN_Direction at TRISB3_bit;
+sbit LCD_D4_Direction at TRISB4_bit;
+sbit LCD_D5_Direction at TRISB5_bit;
+sbit LCD_D6_Direction at TRISB6_bit;
+sbit LCD_D7_Direction at TRISB7_bit;
+
+// External devices (PORTA)
+sbit Relay_Open  at RA0_bit;   // Relay for unlocking
+sbit Relay_Close at RA1_bit;   // Relay for locking
+sbit Buzzer      at RA2_bit;
+sbit Alarm_LED   at RA3_bit;
+
+// =======================================
+// KEYPAD FUNCTION: convert key code to char
+// =======================================
+char get_key_char(unsigned short key_code) {
+    switch (key_code) {
+        case 1:  return '1';
+        case 2:  return '2';
+        case 3:  return '3';
+        case 5:  return '4';
+        case 6:  return '5';
+        case 7:  return '6';
+        case 9:  return '7';
+        case 10: return '8';
+        case 11: return '9';
+        case 13: return '*';
+        case 14: return '0';
+        case 15: return '#';
+        default: return 0;
+    }
+}
+
+// =======================================
+// ENTER CODE (4 digits, masked by '*')
+// buffer: where to store 4 chars + '\0'
+// row, start_col: LCD position for displaying '*'
+// =======================================
+char enter_code(char *buffer, unsigned short row, unsigned short start_col) {
+    char key_char = 0;
+    unsigned short key_val = 0;
+
+    for (i = 0; i < PASS_LEN; i++) {
+        // Wait until a key is clicked
+        do {
+            key_val = Keypad_Key_Click();
+        } while (!key_val);
+
+        key_char = get_key_char(key_val);
+
+        // Accept only digits 0..9
+        if (key_char >= '0' && key_char <= '9') {
+            buffer[i] = key_char;
+            // Display '*' on LCD to hide password
+            Lcd_Chr(row, start_col + i, '*');
+        } else {
+            // Invalid key, repeat this position
+            i--;
+        }
+
+        Delay_ms(200);
+    }
+
+    buffer[PASS_LEN] = '\0';
+
+    // Wait for '#' to confirm
+    do {
+        key_val = Keypad_Key_Click();
+    } while (get_key_char(key_val) != '#');
+
+    return 1;
+}
+
+// =======================================
+// COMPARE TWO 4-DIGIT CODES
+// =======================================
+char compare_code(char *a, char *b) {
+    for (i = 0; i < PASS_LEN; i++) {
+        if (a[i] != b[i]) return 0;
+    }
+    return 1;
+}
+
+// =======================================
+// ALARM FUNCTION (3 wrong attempts)
+// =======================================
+void activate_alarm() {
+    Lcd_Cmd(_LCD_CLEAR);
+    Lcd_Out(1, 2, msg_reset);
+    Lcd_Out(2, 2, msg_lockout);
+
+    for (alarm_time = 0; alarm_time < 10; alarm_time++) {
+        Alarm_LED = 1;
+        Buzzer    = 1;
+        Delay_ms(250);
+        Alarm_LED = 0;
+        Buzzer    = 0;
+        Delay_ms(250);
+    }
+
+    Lcd_Cmd(_LCD_CLEAR);
+    Lcd_Out(1, 3, msg_lockout);
+    Delay_ms(2000);
+}
+
+// =======================================
+// HARDWARE INIT
+// =======================================
+void setup_hw() {
+    ADCON1 = 0x07;   // Disable analog on PORTA/PORTB
+    TRISA  = 0x00;   // PORTA as output (relay, buzzer, LED)
+    TRISB  = 0x00;   // PORTB as output (LCD)
+    TRISD  = 0xF0;   // Upper nibble input for keypad (depending on wiring)
+
+    Relay_Open  = 0;
+    Relay_Close = 1; // Assume "1" = locked
+    Buzzer      = 0;
+    Alarm_LED   = 0;
+
+    Keypad_Init();
+    Lcd_Init();
+    Lcd_Cmd(_LCD_CLEAR);
+    Lcd_Cmd(_LCD_CURSOR_OFF);
+    Delay_ms(500);
+
+    // Welcome screen
+    Lcd_Cmd(_LCD_CLEAR);
+    Lcd_Out(1, 1, msg_welcome1);
+    Lcd_Out(2, 1, msg_welcome2);
+    Delay_ms(2000);
+    Lcd_Cmd(_LCD_CLEAR);
+}
+
+// =======================================
+// EEPROM PASSWORD HANDLING
+// Use marker 0xA5 at EE_ADDR + 4 to indicate password is set
+// =======================================
+#define EE_ADDR       0x00
+#define EE_MARKER     (EE_ADDR + 4)
+#define PASS_MARK_VAL 0xA5
+
+void save_password_to_eeprom() {
+    for (i = 0; i < PASS_LEN; i++) {
+        EEPROM_Write(EE_ADDR + i, current_code[i]);
+        Delay_ms(20);
+    }
+    EEPROM_Write(EE_MARKER, PASS_MARK_VAL); // mark as set
+    Delay_ms(20);
+}
+
+void read_password_from_eeprom() {
+    for (i = 0; i < PASS_LEN; i++) {
+        current_code[i] = EEPROM_Read(EE_ADDR + i);
+    }
+    current_code[PASS_LEN] = '\0';
+}
+
+unsigned short is_password_set() {
+    if (EEPROM_Read(EE_MARKER) == PASS_MARK_VAL) {
+        return 1;
+    } else {
+        return 0;
+    }
+}
+
+void clear_eeprom() {
+    for (i = 0; i < PASS_LEN + 1; i++) {
+        EEPROM_Write(EE_ADDR + i, 0xFF);
+        Delay_ms(20);
+    }
+}
+
+// =======================================
+// SETUP NEW PASSWORD (2 times input)
+// =======================================
+void setup_new_password() {
+    while (1) {
+        // Step 1: enter new code (MA 1)
+        Lcd_Cmd(_LCD_CLEAR);
+        Lcd_Out(1, 2, msg_set1);          // "NHAP MA MOI"
+        Lcd_Out(2, 2, "MA 1: ");
+        enter_code(current_code, 2, 9);   // display '*' from col 9
+
+        Delay_ms(500);
+
+        // Step 2: confirm code (MA 2)
+        Lcd_Cmd(_LCD_CLEAR);
+        Lcd_Out(1, 1, msg_set2);          // "XAC NHAN LAI MA"
+        Lcd_Out(2, 2, "MA 2: ");
+        enter_code(temp_code, 2, 9);
+
+        // Step 3: compare
+        if (compare_code(current_code, temp_code)) {
+            save_password_to_eeprom();
+            Lcd_Cmd(_LCD_CLEAR);
+            Lcd_Out(1, 3, msg_setup_ok);  // "THIET LAP OK"
+            Delay_ms(2000);
+            break;
+        } else {
+            Lcd_Cmd(_LCD_CLEAR);
+            Lcd_Out(1, 1, msg_set_fail);  // "MA KHONG KHOP!"
+            Delay_ms(2000);
+        }
+    }
+}
+
+// =======================================
+// MAIN PROGRAM
+// =======================================
+void main() {
+    setup_hw();
+
+    // First run: if no password in EEPROM → setup new one
+    if (!is_password_set()) {
+        setup_new_password();
+    } else {
+        read_password_from_eeprom();
+    }
+
+    while (1) {
+        // Display input screen
+        Lcd_Cmd(_LCD_CLEAR);
+        Lcd_Out(1, 1, msg_enter_title);   // "NHAP MA (4 SO)"
+        Lcd_Out(2, 1, msg_enter_line2);   // "NHAP: "
+        // Input code at row 2, start from column after "NHAP: "
+        enter_code(input_code, 2, 7);
+
+        // Special reset code: 9999
+        if (compare_code(input_code, reset_code)) {
+            Lcd_Cmd(_LCD_CLEAR);
+            Lcd_Out(1, 1, msg_special_reset); // "RESET HE THONG"
+            clear_eeprom();
+            Delay_ms(2000);
+            setup_new_password();
+            continue;
+        }
+
+        // Normal password check
+        if (compare_code(current_code, input_code)) {
+            // Correct password
+            Lcd_Cmd(_LCD_CLEAR);
+            Lcd_Out(1, 2, msg_success_short); // "MO KHOA OK!"
+            Relay_Open  = 1;
+            Relay_Close = 0;
+            Delay_ms(3000);                   // Door open time
+            Relay_Open  = 0;
+            Relay_Close = 1;
+            fail_count  = 0;
+        } else {
+            // Wrong password
+            fail_count++;
+            if (fail_count >= MAX_FAIL) {
+                activate_alarm();             // 3 wrong attempts
+                fail_count = 0;
+            } else {
+                Lcd_Cmd(_LCD_CLEAR);
+                Lcd_Out(1, 3, msg_denied);    // "SAI MA!"
+                Lcd_Out(2, 2, msg_try_left);  // "CON LAI: "
+                // Show remaining attempts (3 - fail_count)
+                Lcd_Chr(2, 11, '0' + (MAX_FAIL - fail_count));
+                Delay_ms(2000);
+            }
+        }
+    }
